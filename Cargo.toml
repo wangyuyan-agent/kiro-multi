@@ -1,0 +1,42 @@
+[package]
+name = "kiro-pool"
+version = "0.1.0"
+edition = "2021"
+authors = ["wangyuyan-agent <wangyuyan-agent@users.noreply.github.com>"]
+description = "Local Kiro CLI multi-account pool: kiro-pool (control plane) + kiro-wrap (session shim) with per-HOME isolation, flock state, and rate-limit cooldown."
+repository = "https://github.com/wangyuyan-agent/kiro-multi"
+readme = "README.md"
+license = "MIT"
+keywords = ["kiro", "aws", "cli", "multi-account", "rotation"]
+categories = ["command-line-utilities"]
+publish = false
+
+[lib]
+name = "kiro_pool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiro-pool"
+path = "src/bin/kiro-pool.rs"
+
+[[bin]]
+name = "kiro-wrap"
+path = "src/bin/kiro-wrap.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+fs2 = "0.4"
+regex = "1"
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+libc = "0.2"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
