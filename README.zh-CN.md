@@ -13,10 +13,15 @@ Kiro CLI 多账号工具集，两个二进制：
 
 每个 profile 是独立的 `HOME`，`kiro-cli` 的 sqlite / keychain / history 按目录隔离，互不干扰。
 
+## 前置要求
+
+- **Kiro CLI ≥ 2.1**（推荐）。kiro-multi v0.2.0 默认依赖 device-flow 登录和 `toolSearch.enabled` 设置项，这两个都是 Kiro CLI 2.1 才有的。如果必须用更老的 CLI，请固定 `kiro-multi = "0.1"`。
+- **Rust 工具链**用于构建（`cargo install --path .`）。
+
 ## 平台支持
 
-- **macOS**：per-profile keychain（`security create-keychain`）+ `Library/Application Support/kiro-cli/` 路径。
-- **Linux**：keychain 相关是 no-op（`kiro-cli` 在 Linux 自己走文件 fallback），数据路径用 `.local/share/kiro-cli/`（XDG）。其余逻辑一致。
+- **macOS**（Apple Silicon / Intel）：per-profile keychain（`security create-keychain`）+ `Library/Application Support/kiro-cli/` 路径。
+- **Linux**（Ubuntu / Debian / RHEL — Kiro CLI 跑得起来的发行版都行）：keychain 相关是 no-op（`kiro-cli` 在 Linux 自己走文件 fallback），数据路径用 `.local/share/kiro-cli/`（XDG）。其余逻辑一致。Kiro CLI 2.1+ 官方支持 RHEL TUI，pool 这层不挑发行版。
 
 ## 布局
 
@@ -74,7 +79,9 @@ kiro-pool login c --tier pro+              # 个人 Pro+ / Power 档按实际打
   Use with Pro license
 ```
 
-**VPS 远程登录（OAuth callback relay）**：选 Google/GitHub 后，kiro-cli 会在 VPS 上监听 `localhost:3128` 等待 OAuth callback。浏览器在本地完成登录后会跳转到 `http://localhost:3128/...`（页面打不开是正常的）。kiro-pool 会自动检测到 listener 并提示你把浏览器地址栏的 URL 贴回终端，自动 curl 完成回调。无需 SSH 隧道。
+**VPS / SSH / 容器远程登录**（Kiro CLI ≥ 2.1，device flow）：kiro-cli 会打印一个一次性代码 + `https://app.kiro.dev/account/device?user_code=...` URL。在任何浏览器（电脑、手机、随便哪台）打开这个 URL，确认代码即可。**不需要端口转发，不需要 SSH 隧道，不需要 callback URL relay。** kiro-pool 直接 inherit stdio，让提示落到你的终端。
+
+> 旧版 Kiro CLI（< 2.1）走 `localhost:3128` 的 OAuth callback。kiro-multi v0.1.x 为它做了一个 relay 垫片；**v0.2.0 已删除**，因为 device flow 现在是默认，那段垫片只会让你白等 60 秒。如果必须用 < 2.1 的 CLI，请降级到 kiro-multi v0.1.x。
 
 **组织订阅**（有 IAM Identity Center start URL）：
 
@@ -309,7 +316,7 @@ kiro-pool remove A --purge   # 带交互确认；非 TTY 会直接删
 | "⚠️ Internal Error (code: -32603)" | profile 的 quota 已耗尽，AWS 拒绝请求 | 跑 `kiro-pool usage --update-state` 刷新状态；kiro-wrap 下次会自动学习并跳过该 profile |
 | list 里 USAGE 列全是 `-` | 从未查询过 usage | 跑一次 `kiro-pool usage --update-state` 或 `kiro-pool list --refresh-usage` |
 | login 后 list 里 TYPE 显示 `free` 但实际是 student | `--tier` 标签没打对 | `kiro-pool tag <name> student` 修正 |
-| kiro-cli 登录卡住不动（VPS） | OAuth callback 打不到 VPS 的 localhost:3128 | kiro-pool 会提示贴 URL；把浏览器地址栏的 `localhost:3128/...` URL 贴回终端即可 |
+| kiro-cli 登录卡住不动（VPS） | v0.2.0+ 不会出现 — Kiro CLI ≥ 2.1 走 device flow，不用 callback listener | 在任意浏览器打开打印出来的 `app.kiro.dev/account/device?user_code=...` URL 确认即可 |
 | "flock timeout" | 另一个进程持有 state 锁超时 | 检查是否有 zombie wrap 进程；`kill` 掉或等 zombie_minutes 过期自动回收 |
 | profile 月初仍被标为 100% | state.json 里的 resets_at 还没到 | 正常情况 pick 会自动检查 resets_at 并解禁；如果日期不对，手动 `kiro-pool usage --update-state` 刷新 |
 
@@ -435,7 +442,7 @@ kiro-pool login pro_1      --tier pro
 2. 用 `$U` 身份装 kiro-cli；`kiro-cli --version` 验证。
 3. 用 `$U` 跑一次 `kiro-cli chat` 立即退出 —— 让它 bootstrap `bun` / `tui.js` 到 `~/.local/share/kiro-cli/`。跳这步 pool 的 symlink 无处可指。
 4. 用 `$U`：`cargo install --path .`（或拷预编译 binary 到 `~/.cargo/bin/`）。
-5. `kiro-pool login <name> --tier <tier>` 每个账号。VPS 上 Google/GitHub OAuth：kiro-pool 会提示你把浏览器跳转的 `localhost:3128/...` URL 贴回终端。
+5. `kiro-pool login <name> --tier <tier>` 每个账号。VPS 上 Google/GitHub 走 device flow：kiro-cli 会打印 `app.kiro.dev/account/device?user_code=...`，在任意浏览器（电脑/手机）打开 URL 输入代码即可，不需要 SSH 隧道。
 6. `kiro-pool doctor` —— 必须全 `[OK]`。
 7. `kiro-pool usage --update-state` —— 冷启动必做。
 8. 接入集成。openab + systemd 见上面 [systemd 完整范例](#systemd-完整范例) 一节。**`Environment=` 必须同时含 `KIRO_POOL_DIR` 和 `HOME`**。

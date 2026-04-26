@@ -285,57 +285,39 @@ fn cmd_login(
     }
     let want_kind = tier.to_string();
 
-    // spawn kiro-cli（阻塞等 OAuth callback）
-    let mut child = cmd.spawn().context("spawn kiro-cli login")?;
-    let _child_id = child.id();
-
-    // 後台線程：等 kiro-cli 起好 listener 後，提示用戶貼 callback URL
-    // kiro-cli 選完登錄方式後會監聽 localhost:3128，我們輪詢檢測
-    use std::net::TcpStream;
-    use std::thread;
-    let relay_t = thread::spawn(move || {
-        // 等 localhost:3128 有 listener（最多等 60 秒）
-        let mut found = false;
-        for _ in 0..120 {
-            thread::sleep(std::time::Duration::from_millis(500));
-            if TcpStream::connect("127.0.0.1:3128").is_ok() {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return;
-        }
-        // 給用戶時間看到 auth URL
-        thread::sleep(std::time::Duration::from_secs(3));
-        eprintln!();
-        eprintln!("─── kiro-pool OAuth helper ───");
-        eprintln!(
-            "瀏覽器完成登錄後，地址欄會跳轉到 http://localhost:3128/...（頁面無法打開是正常的）。"
-        );
-        eprintln!("請複製地址欄的完整 URL，貼到這裡按 Enter：");
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() {
-            let url = input.trim();
-            if !url.is_empty() && (url.contains("localhost") || url.contains("127.0.0.1")) {
-                let curl_url = url.replace("https://localhost", "http://localhost");
-                eprintln!("正在回傳 callback...");
-                let _ = std::process::Command::new("curl")
-                    .args(["-s", "-o", "/dev/null"])
-                    .arg(&curl_url)
-                    .status();
-            }
-        }
-    });
-
-    let status = child.wait().context("wait kiro-cli login")?;
-    // kiro-cli 已退出（收到 callback 或超時），relay 線程可能還阻塞在 stdin read_line —
-    // Rust 沒有 kill thread 的辦法。為了讓 login 命令及時返回 shell，成功路徑走
-    // std::process::exit(0) 繞開 relay 線程；失敗路徑直接返回 exit code。
-    drop(relay_t);
+    // Kiro CLI ≥ 2.1 ships device-flow login: it prints a one-time code + URL
+    // for the user to confirm in any browser, no localhost:3128 callback
+    // listener and no SSH port forwarding required. We just inherit stdio and
+    // let kiro-cli drive the prompts directly. The legacy OAuth-callback relay
+    // (poll localhost:3128 → ask user to paste the callback URL → curl it
+    // back) was removed in kiro-multi v0.2.0; it's incompatible with device
+    // flow and only added 60s of dead waiting.
+    let status = cmd
+        .spawn()
+        .context("spawn kiro-cli login")?
+        .wait()
+        .context("wait kiro-cli login")?;
 
     if !status.success() {
         return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
+
+    // Tool Search (Kiro CLI ≥ 2.1): lazy-load MCP tool definitions per request
+    // instead of stuffing every tool schema into every prompt. Saves a chunk
+    // of context window and keeps behavior consistent across pool profiles
+    // (otherwise some HOMEs would have it on, some off, depending on whether
+    // the user remembered to flip the setting). Best-effort: silently no-op
+    // on older kiro-cli where the setting key is unknown.
+    let ts = Command::new("kiro-cli")
+        .args(["settings", "toolSearch.enabled", "true"])
+        .env("HOME", &home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match ts {
+        Ok(s) if s.success() => eprintln!("[kiro-pool] toolSearch.enabled = true"),
+        Ok(_) => eprintln!("[kiro-pool] note: toolSearch setting not applied (kiro-cli < 2.1?)"),
+        Err(e) => eprintln!("[kiro-pool] note: skipped toolSearch enable ({e})"),
     }
 
     with_state(pool_dir, |s| {
@@ -350,8 +332,7 @@ fn cmd_login(
         Ok(())
     })?;
     println!("profile {} ready", name);
-    // 強制退出，不等 relay 線程
-    std::process::exit(0);
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_list(pool_dir: &Path, cfg: &Config, json: bool, refresh_usage: bool) -> Result<ExitCode> {

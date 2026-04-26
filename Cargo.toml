@@ -1,6 +1,6 @@
 [package]
 name = "kiro-pool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["wangyuyan-agent <wangyuyan-agent@users.noreply.github.com>"]
 description = "Local Kiro CLI multi-account pool: kiro-pool (control plane) + kiro-wrap (session shim) with per-HOME isolation, flock state, and rate-limit cooldown."

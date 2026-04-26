@@ -13,10 +13,15 @@ Multi-account toolkit for [Kiro CLI](https://aws.amazon.com/kiro/), shipped as t
 
 Each profile is an independent `HOME` — `kiro-cli`'s sqlite / keychain / history are isolated by directory and never leak across accounts.
 
+## Requirements
+
+- **Kiro CLI ≥ 2.1** (recommended). v0.2.0 of kiro-multi assumes device-flow login and the `toolSearch.enabled` setting key — both shipped in Kiro CLI 2.1. If you must stay on a CLI older than 2.1, pin `kiro-multi = "0.1"`.
+- **Rust toolchain** to build (`cargo install --path .`).
+
 ## Platform support
 
-- **macOS**: per-profile keychain (`security create-keychain`) + `Library/Application Support/kiro-cli/` paths. The `security` calls run with an isolated `HOME`, so your real user keychain search list is **never** polluted.
-- **Linux**: keychain code is a no-op (Kiro CLI uses a file-based fallback on Linux); data lives under `.local/share/kiro-cli/` (XDG). Everything else is identical.
+- **macOS** (Apple Silicon / Intel): per-profile keychain (`security create-keychain`) + `Library/Application Support/kiro-cli/` paths. The `security` calls run with an isolated `HOME`, so your real user keychain search list is **never** polluted.
+- **Linux** (Ubuntu / Debian / RHEL — anywhere Kiro CLI runs): keychain code is a no-op (Kiro CLI uses a file-based fallback on Linux); data lives under `.local/share/kiro-cli/` (XDG). Everything else is identical. Kiro CLI 2.1+ added official RHEL TUI support; the pool layer doesn't care which distro you pick.
 
 ## Layout
 
@@ -74,7 +79,9 @@ The Kiro CLI login menu pops up:
   Use with Pro license
 ```
 
-**Remote login on a VPS (OAuth callback relay)**: with the Google/GitHub method, kiro-cli listens on `localhost:3128` for the OAuth callback. After completing login in your browser, the page tries to redirect to `http://localhost:3128/...` (failing to load is expected). kiro-pool detects the listener and prompts you to paste that URL back into the terminal — it then `curl`s the callback for you. No SSH tunnel needed.
+**Remote login on a VPS / SSH / container** (Kiro CLI ≥ 2.1, device flow): kiro-cli prints a one-time code plus a `https://app.kiro.dev/account/device?user_code=...` URL. Open the URL in any browser (your laptop, your phone, anywhere), confirm the code, done. No port forwarding, no SSH tunnel, no callback URL relay. kiro-pool just inherits stdio so the prompt lands directly in your terminal.
+
+> Older Kiro CLI (< 2.1) used a `localhost:3128` OAuth callback. kiro-multi v0.1.x had a relay shim for that flow; **v0.2.0 dropped it** because device flow is now the default and the shim only added 60 seconds of dead waiting. If you need to log in with a CLI older than 2.1, downgrade to kiro-multi v0.1.x.
 
 **Organization subscription** (with an IAM Identity Center start URL):
 
@@ -313,7 +320,7 @@ This means the pool never refuses service just because concurrency exceeds the p
 | "⚠️ Internal Error (code: -32603)" | profile's quota is exhausted; AWS rejected the request | run `kiro-pool usage --update-state`; the next wrap auto-learns and skips this profile |
 | `list` USAGE column is all `-` | usage was never queried | run `kiro-pool usage --update-state` once, or `kiro-pool list --refresh-usage` |
 | TYPE shows `free` after login but profile is actually student | `--tier` label was wrong | `kiro-pool tag <name> student` |
-| kiro-cli login hangs (VPS) | OAuth callback can't reach the VPS's `localhost:3128` | kiro-pool will prompt — paste the browser's `localhost:3128/...` URL back into the terminal |
+| kiro-cli login hangs (VPS) | n/a in v0.2.0+ — Kiro CLI ≥ 2.1 uses device flow, no callback listener | open the printed `app.kiro.dev/account/device?user_code=...` URL in any browser to confirm |
 | "flock timeout" | another process is holding the state lock | check for zombie wrap processes; `kill` them or wait for `zombie_minutes` to elapse |
 | Profile still shown 100% after the reset day | `resets_at` in state.json hasn't actually passed yet | normally pick auto-checks `resets_at` and unfreezes; if the date is wrong, refresh with `kiro-pool usage --update-state` |
 | macOS `security` keeps polluting the user keychain search list | older versions of this tool ran `security` without isolating HOME | `kiro-pool fix-keychain` to scrub; new builds (≥ v0.1.0) prevent it at the source |
@@ -440,7 +447,7 @@ Standard VPS deploy checklist (do these in order, do not skip):
 2. As `$U`, install kiro-cli first; verify with `kiro-cli --version`.
 3. Run `kiro-cli chat` once and exit immediately — this bootstraps `bun` / `tui.js` into `~/.local/share/kiro-cli/`. Skip this and pool symlinks have nothing to point at.
 4. As `$U`: `cargo install --path .` (or copy prebuilt binary into `~/.cargo/bin/`).
-5. `kiro-pool login <name> --tier <tier>` for each account. For Google/GitHub OAuth on a headless VPS: kiro-pool will prompt to paste the `localhost:3128/...` URL from the browser back into the terminal.
+5. `kiro-pool login <name> --tier <tier>` for each account. On a headless VPS with Google/GitHub: kiro-cli ≥ 2.1 prints a device-flow URL (`app.kiro.dev/account/device?user_code=...`) — open it in any browser (laptop, phone) and confirm. No SSH tunnel needed.
 6. `kiro-pool doctor` — must be all `[OK]`.
 7. `kiro-pool usage --update-state` — mandatory cold-start.
 8. Wire up the integration. For openab + systemd, see the [Full systemd example](#full-systemd-example) section above. **Always include both `KIRO_POOL_DIR` and `HOME` in `Environment=`**.
