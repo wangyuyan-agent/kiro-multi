@@ -84,8 +84,21 @@ fn ensure_home() {
     std::process::exit(1);
 }
 
+fn configure_child_command(
+    cmd: &mut Command,
+    args: &[String],
+    effective_home: &Path,
+    real_home: &str,
+) {
+    cmd.args(args)
+        .env("HOME", effective_home)
+        .env("KIRO_REAL_HOME", real_home)
+        .env("KIRO_PROFILE_HOME", effective_home);
+}
+
 fn run() -> Result<ExitCode> {
     ensure_home();
+    let real_home = std::env::var("HOME").context("HOME not set after ensure_home")?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let pool_dir = resolve_pool_dir(None)?;
     fs::create_dir_all(&pool_dir)?;
@@ -215,10 +228,8 @@ fn run() -> Result<ExitCode> {
     let tee_stdout = !no_tee_env && subcmd != Some("acp") && !std::io::stdout().is_terminal();
 
     let mut cmd = Command::new("kiro-cli");
-    cmd.args(&args)
-        .env("HOME", &effective_home)
-        .stdin(Stdio::inherit())
-        .stderr(Stdio::piped());
+    configure_child_command(&mut cmd, &args, &effective_home, &real_home);
+    cmd.stdin(Stdio::inherit()).stderr(Stdio::piped());
     if tee_stdout {
         cmd.stdout(Stdio::piped());
     } else {
@@ -441,7 +452,8 @@ fn log_cooldown(
 
 #[cfg(test)]
 mod tests {
-    use super::inject_default_subcmd;
+    use super::{configure_child_command, inject_default_subcmd};
+    use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -488,6 +500,41 @@ mod tests {
         assert_eq!(
             inject_default_subcmd(v(&["chat", "--help"])),
             v(&["chat", "--help"])
+        );
+    }
+
+    #[test]
+    fn child_env_exposes_real_and_profile_home() {
+        let profile_home = PathBuf::from("/tmp/kiro-profile");
+        let real_home = "/tmp/real-home";
+        let args = v(&["acp", "--trust-all-tools"]);
+        let mut cmd = Command::new("kiro-cli");
+
+        configure_child_command(&mut cmd, &args, &profile_home, real_home);
+
+        let envs: BTreeMap<OsString, Option<OsString>> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            envs.get(&OsString::from("HOME")).and_then(|v| v.as_ref()),
+            Some(&profile_home.clone().into_os_string())
+        );
+        assert_eq!(
+            envs.get(&OsString::from("KIRO_PROFILE_HOME"))
+                .and_then(|v| v.as_ref()),
+            Some(&profile_home.into_os_string())
+        );
+        assert_eq!(
+            envs.get(&OsString::from("KIRO_REAL_HOME"))
+                .and_then(|v| v.as_ref()),
+            Some(&OsString::from(real_home))
+        );
+        assert_eq!(
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            args
         );
     }
 }

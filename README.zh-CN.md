@@ -177,13 +177,22 @@ power   = "claude-opus-4.6"
 
 改完直接生效，不需要重启什么进程（每次 wrap / pool 启动都会读）。
 
-### kiro-wrap env 开关
+### kiro-wrap 环境变量
+
+调用方传入的 env 开关：
 
 | env | 作用 |
 |---|---|
 | `KIRO_POOL_DIR` | 覆盖默认 `~/.kiro-pool` |
 | `KIRO_POOL_PROFILE` | 指定使用某个 profile，跳过轮转（仍标 in_use / release） |
 | `KIRO_WRAP_NO_STDOUT_TEE=1` | 强制 stdout 直接 `inherit`，不走 tee+ring。ACP 子命令已经自动走这条路径，其他 pipeline 场景遇到握手超时可手动打开 |
+
+kiro-wrap 注入给子进程 `kiro-cli` 的 env：
+
+| env | 作用 |
+|---|---|
+| `KIRO_REAL_HOME` | kiro-wrap 改写前的调用方真实 HOME |
+| `KIRO_PROFILE_HOME` | 本次 session 实际使用的 Kiro profile HOME，shared 模式下会是 `__shared_<pid>` 临时 HOME |
 
 ## kiro-wrap
 
@@ -195,14 +204,14 @@ power   = "claude-opus-4.6"
 - stdin `inherit`；stderr 永远被 tee（64 KiB 环形缓冲供 cooldown 判定）；stdout 在 TTY 下 `inherit`（保留交互 chat 原样），非 TTY（openab / ACP / pipeline）下也 tee 一份进环形缓冲，防止 kiro-cli 把 rate-limit 报错写到 stdout 而被漏判。
 - 退出码透传子进程；被信号杀时返回 `128 + signum`。
 - SIGINT / SIGTERM / SIGHUP 会转发给子进程（不自己吞）。
-- env：`KIRO_POOL_DIR` 覆盖默认 `~/.kiro-pool`；`HOME` 会被 wrap 重写成 `<pool>/profiles/<picked>`。
+- env：`KIRO_POOL_DIR` 覆盖默认 `~/.kiro-pool`；`HOME` 会被 wrap 重写成 `<pool>/profiles/<picked>`；`KIRO_REAL_HOME` / `KIRO_PROFILE_HOME` 会把改写前后的两个 HOME 暴露给 agent。
 - **HOME 防御**：如果启动时 `HOME` 未设，会尝试从 `getpwuid` 获取；仍然失败则打明确错误退出（避免 openab 等调用方忘记传 HOME 导致静默失败）。
 
 **流程**：
 
 1. 原子 pick 一个档位最低的可用 profile，标 `in_use_since`（flock 保护）
 2. 补齐 per-profile keychain + runtime symlink（`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`）
-3. `spawn HOME=<pool>/profiles/<name> kiro-cli <args...>`
+3. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`
 4. 子进程退出时：
    - stderr tail（非 TTY 场景也包含 stdout tail）匹配 `cooldown_regex` → 设 cooldown 并把 tail 落到 `logs/<name>-<pid>-<ts>.log`；logs 按 `log_keep` 自动轮转
    - 检测到 quota 耗尽信号（`-32603` / `Internal error`）→ 额外标记 `last_usage = 100%`，后续 pick 跳过
@@ -253,6 +262,24 @@ env         = { KIRO_POOL_DIR = "/root/.kiro-pool", HOME = "/root" }
 - **`env.KIRO_POOL_DIR`**：pool 目录位置，默认 `~/.kiro-pool`。显式设置避免歧义。
 
 > **注意**：调用方 env 中必须包含 `HOME`，否则 kiro-wrap 无法初始化 profile 环境。
+
+Coding agent 工具凭据：
+
+kiro-wrap 会刻意把 Kiro CLI 放进 profile HOME。也就是说，agent 启动的工具同样会看到 `$HOME` 是 profile 目录，真实 HOME 里的用户级凭据不会自动出现。这对 `gh`、`git`、`ssh`、`aws`、`docker`、npm 类 CLI 都是正常现象。
+
+kiro-wrap 会把原始 HOME 暴露为 `KIRO_REAL_HOME`。agent 在执行需要用户级凭据的命令时，应显式选择真实 HOME：
+
+```bash
+HOME="$KIRO_REAL_HOME" gh auth status
+GH_CONFIG_DIR="$KIRO_REAL_HOME/.config/gh" gh auth status
+HOME="$KIRO_REAL_HOME" git config --global user.email
+```
+
+建议写入 agent 长期记忆 / 全局说明：
+
+```md
+When running under kiro-multi, HOME is a Kiro profile home. The original user home is available as KIRO_REAL_HOME, and the current Kiro profile home is KIRO_PROFILE_HOME. For external developer tools that need user-level credentials or config, such as gh, git, ssh, aws, docker, npm, or cloud CLIs, prefer running them with HOME="$KIRO_REAL_HOME" or the tool-specific config env.
+```
 
 操作建议：
 
@@ -312,6 +339,7 @@ kiro-pool remove A --purge   # 带交互确认；非 TTY 会直接删
 | 现象 | 原因 | 解法 |
 |------|------|------|
 | Discord bot 报 "⚠️ Connection Lost" | kiro-wrap 启动时 `HOME` 未设，setup 阶段立刻退出 | openab config.toml 的 env 加 `HOME = "/root"`（或对应用户的 home） |
+| 在 kiro-wrap 里 `gh auth status` 显示未登录，但普通 shell 已登录 | `$HOME` 按设计是 Kiro profile HOME，`gh` 会找 `<profile>/.config/gh` 而不是真实用户配置 | 用 `HOME="$KIRO_REAL_HOME" gh ...` 或 `GH_CONFIG_DIR="$KIRO_REAL_HOME/.config/gh" gh ...`；并给 agent 加上上面的长期说明 |
 | "all profiles busy or in cooldown" | 池中所有 profile 都在 cooldown（shared fallback 已启用，纯 in_use 不再报此错） | 等 cooldown 过期（默认 5 分钟），或加更多账号 |
 | "⚠️ Internal Error (code: -32603)" | profile 的 quota 已耗尽，AWS 拒绝请求 | 跑 `kiro-pool usage --update-state` 刷新状态；kiro-wrap 下次会自动学习并跳过该 profile |
 | list 里 USAGE 列全是 `-` | 从未查询过 usage | 跑一次 `kiro-pool usage --update-state` 或 `kiro-pool list --refresh-usage` |
@@ -388,6 +416,7 @@ WantedBy=multi-user.target
 6. **从 systemd / cron / openab 调 `kiro-wrap` 时，调用方 env 必须含 `HOME`。** 缺 `HOME` = 启动时硬错误。一律显式设置。
 7. **冷启动后必须刷 usage**：任何全新安装或清空 `state.json` 后，第一次跑实际 session 之前一定要先跑 `kiro-pool usage --update-state`，否则首次 pick 可能命中已耗尽的 profile 并报错。
 8. **一个 AWS 账号 = 一台机器上一个 profile。** 不要把同一个账号同时登录到两台机器的不同 pool —— kiro-cli 的 session state 会分叉，其中一边会静默失效。
+9. **在 kiro-wrap 内，`$HOME` 是 Kiro profile HOME。** 外部工具如果需要真实用户的全局凭据或配置，要显式使用 `KIRO_REAL_HOME`，例如 `HOME="$KIRO_REAL_HOME" gh auth status`。不要默认把整棵 dotfiles 复制进 profile HOME。
 
 ### 路径 A — 本地单账号
 
@@ -432,6 +461,7 @@ kiro-pool login pro_1      --tier pro
 | 用户报的现象 | 根因 | 怎么验证 | 修法 |
 |---|---|---|---|
 | "Connection Lost" / 启动时静默退出 | 调用方 env 缺 `HOME` | 看 systemd unit / openab config | env 加 `HOME=/<用户家目录>` |
+| `gh` / `git` / `ssh` 看起来像空用户配置 | agent tool shell 按设计运行在 profile HOME | 在 agent 里看 `echo "$HOME"; echo "$KIRO_REAL_HOME"` | 教 agent 在需要用户级凭据时使用 `HOME="$KIRO_REAL_HOME" <tool>` |
 | `kiro-cli` not found | systemd `User=` 与 cargo install user 不一致 | 用 systemd user 跑 `which kiro-wrap` | 全用绝对路径 `/<家目录>/.cargo/bin/kiro-wrap`；不要依赖 PATH |
 | 重启后第一个请求 `-32603` | 启动时没刷 usage | 看 `state.json` 里 `last_usage` 是不是空 | systemd unit 加 `ExecStartPre=/<家目录>/.cargo/bin/kiro-pool usage --update-state` |
 | `flock timeout` / pick 失败 | `~/.kiro-pool/` owner 不对 | `ls -la ~/.kiro-pool/state.json` | `chown -R <systemd-user>:<group> ~/.kiro-pool/`；如果 openab 跑非 root 用户，就不要用 root 跑 `kiro-pool`，反之亦然 |
@@ -490,5 +520,3 @@ kiro-pool login pro_1      --tier pro
 ## License
 
 MIT —— 见 [LICENSE](LICENSE)。
-
-

@@ -179,13 +179,22 @@ power   = "claude-opus-4.6"
 
 Changes take effect on the next invocation — no daemon to restart.
 
-### kiro-wrap env switches
+### kiro-wrap environment
+
+Incoming env switches:
 
 | env | effect |
 |---|---|
 | `KIRO_POOL_DIR` | override the default `~/.kiro-pool` |
 | `KIRO_POOL_PROFILE` | force a specific profile, skip rotation (still tracked as in_use / released) |
 | `KIRO_WRAP_NO_STDOUT_TEE=1` | force stdout `inherit` instead of tee+ring. ACP already takes this path automatically; flip this if a non-ACP pipeline gets stuck on handshake |
+
+Exported to the child `kiro-cli` process:
+
+| env | effect |
+|---|---|
+| `KIRO_REAL_HOME` | the caller's real HOME before kiro-wrap rewrites it |
+| `KIRO_PROFILE_HOME` | the effective Kiro profile HOME assigned to this session, including `__shared_<pid>` homes |
 
 ## kiro-wrap
 
@@ -198,14 +207,14 @@ A transparent shim around `kiro-cli` that lifts the "which account?" decision ou
 - stdin: `inherit`. stderr: always teed (64 KiB ring buffer drives cooldown detection). stdout: `inherit` on a TTY (preserves interactive chat); on non-TTY (openab / ACP / pipelines) also teed into the ring buffer so kiro-cli can't sneak a rate-limit message past us via stdout.
 - Exit code is propagated; killed-by-signal returns `128 + signum`.
 - SIGINT / SIGTERM / SIGHUP are forwarded to the child (not swallowed).
-- env: `KIRO_POOL_DIR` overrides the default `~/.kiro-pool`; `HOME` is rewritten to `<pool>/profiles/<picked>` for the child.
+- env: `KIRO_POOL_DIR` overrides the default `~/.kiro-pool`; `HOME` is rewritten to `<pool>/profiles/<picked>` for the child; `KIRO_REAL_HOME` and `KIRO_PROFILE_HOME` expose both sides of that rewrite to the agent.
 - **HOME defence**: if `HOME` is unset at startup, kiro-wrap tries `getpwuid` first; if that also fails, it exits with a clear error rather than silently failing inside setup (a common openab footgun).
 
 **Flow**:
 
 1. Atomically pick the lowest-tier available profile, mark `in_use_since` (flock-protected).
 2. Materialize per-profile keychain + runtime symlinks (`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`).
-3. `spawn HOME=<pool>/profiles/<name> kiro-cli <args...>`.
+3. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`.
 4. On child exit:
    - If the stderr tail (and stdout tail in non-TTY mode) matches `cooldown_regex` → set cooldown and dump the tail to `logs/<name>-<pid>-<ts>.log`. Logs auto-rotate at `log_keep`.
    - If a quota-exhaustion signal (`-32603` / `Internal error`) is detected → also mark `last_usage = 100%` so future picks skip the profile.
@@ -257,6 +266,24 @@ Field notes:
 - **`env.KIRO_POOL_DIR`**: pool directory, defaults to `~/.kiro-pool`. Set explicitly to remove ambiguity.
 
 > **Note**: the caller's env must include `HOME`, or kiro-wrap can't bootstrap the profile environment.
+
+Coding-agent tool credentials:
+
+`kiro-wrap` intentionally gives Kiro CLI a profile HOME. That means tools launched by the agent also see `$HOME` as the profile directory, so user-level credentials in the real HOME are not found automatically. This is expected for tools such as `gh`, `git`, `ssh`, `aws`, `docker`, and npm-like CLIs.
+
+kiro-wrap exports the original home as `KIRO_REAL_HOME`. Agents should opt into it when a command needs user-level credentials:
+
+```bash
+HOME="$KIRO_REAL_HOME" gh auth status
+GH_CONFIG_DIR="$KIRO_REAL_HOME/.config/gh" gh auth status
+HOME="$KIRO_REAL_HOME" git config --global user.email
+```
+
+Recommended persistent instruction for agents:
+
+```md
+When running under kiro-multi, HOME is a Kiro profile home. The original user home is available as KIRO_REAL_HOME, and the current Kiro profile home is KIRO_PROFILE_HOME. For external developer tools that need user-level credentials or config, such as gh, git, ssh, aws, docker, npm, or cloud CLIs, prefer running them with HOME="$KIRO_REAL_HOME" or the tool-specific config env.
+```
 
 Operational notes:
 
@@ -316,6 +343,7 @@ This means the pool never refuses service just because concurrency exceeds the p
 | Symptom | Cause | Fix |
 |---|---|---|
 | Discord bot reports "⚠️ Connection Lost" | kiro-wrap exited at startup because `HOME` was unset | add `HOME = "/root"` (or the deploy user's home) to openab config.toml's env |
+| `gh auth status` says "not logged in" inside kiro-wrap but works in your normal shell | `$HOME` is intentionally the Kiro profile HOME, so `gh` looks under `<profile>/.config/gh` instead of the real user's config | run `HOME="$KIRO_REAL_HOME" gh ...` or `GH_CONFIG_DIR="$KIRO_REAL_HOME/.config/gh" gh ...`; add the agent instruction above |
 | "all profiles busy or in cooldown" | every profile is in cooldown (shared fallback already handles pure in-use saturation) | wait out the cooldown (default 5 min) or add more accounts |
 | "⚠️ Internal Error (code: -32603)" | profile's quota is exhausted; AWS rejected the request | run `kiro-pool usage --update-state`; the next wrap auto-learns and skips this profile |
 | `list` USAGE column is all `-` | usage was never queried | run `kiro-pool usage --update-state` once, or `kiro-pool list --refresh-usage` |
@@ -393,6 +421,7 @@ If the user's intent is ambiguous, ask **one** clarifying question. Do not assum
 6. **`HOME` must be set in the calling environment** when invoking `kiro-wrap` from systemd / cron / openab. Missing `HOME` = hard error at startup. Always set it explicitly.
 7. **Cold-start usage refresh is mandatory** after any fresh install or `state.json` wipe — run `kiro-pool usage --update-state` once before the first real session, otherwise the first pick may hit an exhausted profile and crash.
 8. **One AWS account = one profile on one host.** Do not log the same account into two pools on different hosts simultaneously — kiro-cli's session state will diverge and one side will silently break.
+9. **Inside kiro-wrap, `$HOME` is the Kiro profile HOME.** If an external tool needs the real user's global credentials or config, use `KIRO_REAL_HOME` explicitly, for example `HOME="$KIRO_REAL_HOME" gh auth status`. Do not copy broad dotfile trees into profile homes as a default fix.
 
 ### Path A — local single account
 
@@ -437,6 +466,7 @@ This is the most error-prone path. The four common failure modes:
 | Symptom user reports | Root cause | Verify with | Fix |
 |---|---|---|---|
 | "Connection Lost" / silent fail at session start | Caller's env missing `HOME` | check the systemd unit / openab config | add `HOME=/<user-home>` to env |
+| `gh` / `git` / `ssh` sees a blank user config | Agent tool shell runs with the profile HOME by design | `echo "$HOME"; echo "$KIRO_REAL_HOME"` inside the agent | teach the agent to use `HOME="$KIRO_REAL_HOME" <tool>` when it needs user-level credentials |
 | `kiro-cli` not found / no such file | systemd `User=` differs from cargo install user | `which kiro-wrap` as the systemd user | use absolute path `/<home>/.cargo/bin/kiro-wrap` everywhere; never rely on PATH |
 | First request after restart errors with `-32603` | No usage refresh done at boot | check `state.json` for empty `last_usage` | add `ExecStartPre=/<home>/.cargo/bin/kiro-pool usage --update-state` to systemd unit |
 | `flock timeout` / pick fails | Wrong owner on `~/.kiro-pool/` | `ls -la ~/.kiro-pool/state.json` | `chown -R <systemd-user>:<group> ~/.kiro-pool/`; never run `kiro-pool` as root if openab runs as a non-root user (or vice versa) |
