@@ -127,7 +127,7 @@ kiro-pool usage student_1          # one profile only
 **Quota exhaustion handled automatically**:
 
 - **Passive learning**: when a session ends, kiro-wrap inspects the stderr tail for quota signals (`-32603 Internal error` etc.) and marks the profile at 100%. Subsequent picks skip it. One mistake is enough — no preflight needed.
-- **Lazy preflight**: before an automatic pick, kiro-wrap refreshes stale usage for idle, non-cooldown profiles. The default TTL is 5 minutes and a separate `usage-refresh.lock` prevents concurrent refresh storms.
+- **Lazy preflight**: before an automatic pick, kiro-wrap refreshes stale usage for idle, non-cooldown profiles. Known 100% profiles are skipped until their reset day. The default TTL is 5 minutes and a separate `usage-refresh.lock` prevents concurrent refresh storms.
 - **Auto-unfreeze on reset day**: at pick time, if `resets_at` has passed, the stale 100% mark is ignored automatically.
 - **Cold-start protection**: lazy preflight covers a fresh `state.json` on the first automatic pick. `ExecStartPre=/path/to/kiro-pool usage --update-state` is still useful for systemd deployments when you want to pay that latency at service start instead of on the first user request.
 

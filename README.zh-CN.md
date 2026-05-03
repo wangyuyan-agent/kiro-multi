@@ -127,7 +127,7 @@ kiro-pool usage student_1          # 只查某个 profile
 **Quota 耗尽自动处理**：
 
 - **被动学习**：kiro-wrap 在 session 结束时如果检测到 quota 相关错误（`-32603 Internal error` 等），会自动把该 profile 标记为 100% 用尽，后续 pick 跳过。第一次撞墙即学会，无需预先查询。
-- **懒 preflight**：自动 pick 前，kiro-wrap 会按 TTL 刷新空闲、非 cooldown profile 的陈旧 usage。默认 5 分钟 TTL，并用独立的 `usage-refresh.lock` 避免并发刷新风暴。
+- **懒 preflight**：自动 pick 前，kiro-wrap 会按 TTL 刷新空闲、非 cooldown profile 的陈旧 usage。已知 100% 的 profile 会跳过，直到 reset day 再刷新解禁。默认 5 分钟 TTL，并用独立的 `usage-refresh.lock` 避免并发刷新风暴。
 - **月初自动解禁**：pick 时如果 `resets_at` 日期已过（月初 quota 重置），自动忽略旧的 100% 标记，允许重新 pick。
 - **冷启动保护**：全新 `state.json` 的首次自动 pick 会由懒 preflight 补 usage。systemd 里保留 `ExecStartPre=/path/to/kiro-pool usage --update-state` 仍然有价值，它只是把刷新延迟放到服务启动时，而不是第一个用户请求上。
 

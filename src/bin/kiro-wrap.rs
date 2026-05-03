@@ -9,7 +9,7 @@ use kiro_pool::{
     pick::{pick, Picked},
     profile_home, resolve_pool_dir, rotate_logs,
     state::{read_state, with_state},
-    State, STDERR_RING_CAP,
+    ProfileUsage, State, STDERR_RING_CAP,
 };
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -170,6 +170,13 @@ fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Ve
             if profile.cooldown_until.is_some_and(|cd| cd > now) {
                 return false;
             }
+            if profile
+                .last_usage
+                .as_ref()
+                .is_some_and(|usage| usage_exhausted_until_reset(usage, now))
+            {
+                return false;
+            }
             match profile
                 .last_usage
                 .as_ref()
@@ -181,6 +188,19 @@ fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Ve
         })
         .cloned()
         .collect()
+}
+
+fn usage_exhausted_until_reset(usage: &ProfileUsage, now: DateTime<Utc>) -> bool {
+    if usage.used_percent < 100.0 {
+        return false;
+    }
+    let expired = usage
+        .resets_at
+        .as_deref()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .map(|reset_date| now.date_naive() >= reset_date)
+        .unwrap_or(false);
+    !expired
 }
 
 fn acquire_usage_preflight_lock(pool_dir: &Path, timeout_ms: u64) -> Result<Option<File>> {
@@ -588,6 +608,15 @@ mod tests {
         }
     }
 
+    fn exhausted_usage(updated_at: chrono::DateTime<Utc>, resets_at: &str) -> ProfileUsage {
+        ProfileUsage {
+            used_percent: 100.0,
+            updated_at: Some(updated_at),
+            resets_at: Some(resets_at.to_string()),
+            ..ProfileUsage::default()
+        }
+    }
+
     #[test]
     fn empty_args_get_chat_prepended() {
         assert_eq!(inject_default_subcmd(v(&[])), v(&["chat"]));
@@ -735,5 +764,55 @@ mod tests {
         );
 
         assert_eq!(usage_preflight_names(&state, now, 0), vec!["fresh"]);
+    }
+
+    #[test]
+    fn usage_preflight_skips_exhausted_profiles_until_reset_day() {
+        let now = Utc::now();
+        let future_reset = (now + Duration::days(1))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let past_reset = (now - Duration::days(1))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut state = State {
+            order: vec![
+                "exhausted".to_string(),
+                "reset_ready".to_string(),
+                "unknown_reset".to_string(),
+            ],
+            ..State::default()
+        };
+        state.profiles.insert(
+            "exhausted".to_string(),
+            Profile {
+                last_usage: Some(exhausted_usage(now - Duration::hours(1), &future_reset)),
+                ..Profile::default()
+            },
+        );
+        state.profiles.insert(
+            "reset_ready".to_string(),
+            Profile {
+                last_usage: Some(exhausted_usage(now - Duration::hours(1), &past_reset)),
+                ..Profile::default()
+            },
+        );
+        state.profiles.insert(
+            "unknown_reset".to_string(),
+            Profile {
+                last_usage: Some(ProfileUsage {
+                    used_percent: 100.0,
+                    updated_at: Some(now - Duration::hours(1)),
+                    ..ProfileUsage::default()
+                }),
+                ..Profile::default()
+            },
+        );
+
+        let names = usage_preflight_names(&state, now, 300);
+
+        assert_eq!(names, vec!["reset_ready".to_string()]);
     }
 }
