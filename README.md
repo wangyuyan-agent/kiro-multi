@@ -127,8 +127,9 @@ kiro-pool usage student_1          # one profile only
 **Quota exhaustion handled automatically**:
 
 - **Passive learning**: when a session ends, kiro-wrap inspects the stderr tail for quota signals (`-32603 Internal error` etc.) and marks the profile at 100%. Subsequent picks skip it. One mistake is enough — no preflight needed.
+- **Lazy preflight**: before an automatic pick, kiro-wrap refreshes stale usage for idle, non-cooldown profiles. The default TTL is 5 minutes and a separate `usage-refresh.lock` prevents concurrent refresh storms.
 - **Auto-unfreeze on reset day**: at pick time, if `resets_at` has passed, the stale 100% mark is ignored automatically.
-- **Cold-start requirement**: on a fresh install or after wiping `state.json`, you **must** run `kiro-pool usage --update-state` once. Otherwise the first pick may hit a fully drained profile and crash. systemd users should add `ExecStartPre=/path/to/kiro-pool usage --update-state`.
+- **Cold-start protection**: lazy preflight covers a fresh `state.json` on the first automatic pick. `ExecStartPre=/path/to/kiro-pool usage --update-state` is still useful for systemd deployments when you want to pay that latency at service start instead of on the first user request.
 
 ## Pick / release (rarely needed by hand)
 
@@ -165,6 +166,9 @@ default_error_cooldown_min = 5        # default cooldown applied by release --er
 cooldown_regex            = "(?i)(concurrent|too many|retry in \\d|throttl|rate[\\s-]?limit|try again later|quota|exceeded)"
 log_keep                  = 50        # keep the most recent N cooldown tail logs in logs/
 flock_timeout_ms          = 5000      # flock acquire timeout per command
+usage_preflight_enabled   = true      # kiro-wrap refreshes stale idle usage before automatic pick
+usage_preflight_ttl_secs  = 300       # refresh an idle profile only when cached usage is older than this
+usage_preflight_lock_timeout_ms = 60000 # wait for another preflight refresh before using cached usage
 
 # tier → kiro-cli default model. wrap injects `--model <X>` automatically based on the picked profile's
 # tier, since settings/cli.json is shared across the pool — per-profile override has to be a CLI flag.
@@ -212,14 +216,15 @@ A transparent shim around `kiro-cli` that lifts the "which account?" decision ou
 
 **Flow**:
 
-1. Atomically pick the lowest-tier available profile, mark `in_use_since` (flock-protected).
-2. Materialize per-profile keychain + runtime symlinks (`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`).
-3. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`.
-4. On child exit:
+1. If no `KIRO_POOL_PROFILE` is forced, refresh stale usage for idle, non-cooldown profiles according to `usage_preflight_ttl_secs`.
+2. Atomically pick the lowest-tier available profile, mark `in_use_since` (flock-protected).
+3. Materialize per-profile keychain + runtime symlinks (`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`).
+4. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`.
+5. On child exit:
    - If the stderr tail (and stdout tail in non-TTY mode) matches `cooldown_regex` → set cooldown and dump the tail to `logs/<name>-<pid>-<ts>.log`. Logs auto-rotate at `log_keep`.
    - If a quota-exhaustion signal (`-32603` / `Internal error`) is detected → also mark `last_usage = 100%` so future picks skip the profile.
    - Otherwise just clear `in_use_since`.
-5. When cooldown fires, inspect `~/.kiro-pool/logs/` for the actual AWS message and tweak `cooldown_regex` in `config.toml` if needed.
+6. When cooldown fires, inspect `~/.kiro-pool/logs/` for the actual AWS message and tweak `cooldown_regex` in `config.toml` if needed.
 
 ### Day-to-day use
 
@@ -298,7 +303,7 @@ VPS deploy checklist:
 1. `kiro-pool login <name> --tier <...>` for each account.
 2. Run `kiro-cli chat` once under your real HOME so it bootstraps `bun` / `tui.js` into the kiro-cli data dir (macOS: `~/Library/Application Support/kiro-cli/`; Linux: `~/.local/share/kiro-cli/`). Without this, the pool's symlinks have nothing to point at.
 3. `kiro-pool doctor`; `kiro-pool list` and check TYPE / LAST_LOGIN.
-4. `kiro-pool usage --update-state` to populate usage (avoid first-call wall-hits).
+4. Recommended: `kiro-pool usage --update-state` to populate usage up front. If you skip it, kiro-wrap lazy preflight still runs before automatic picks.
 5. Run openab under systemd; the env must contain `KIRO_POOL_DIR` and `HOME`; the systemd `User=` must own the pool dir (flock permissions).
 
 ## Remove
@@ -335,7 +340,7 @@ This means the pool never refuses service just because concurrency exceeds the p
 - No scoring / weighting: tier-step already encodes "save the high tier", weights add nothing.
 - No randomization: deterministic round-robin is easier to debug ("who got picked last?").
 - No cron: kiro-cli refreshes its own access_token before expiry.
-- No active quota probing: passive learning (mark 100% on wall-hit) + auto-unfreeze at month boundary covers all practical cases.
+- No always-on quota probing loop: kiro-wrap only refreshes stale idle usage before automatic picks, plus passive learning (mark 100% on wall-hit) and auto-unfreeze at month boundary.
 - One AWS account → one profile on one host; **don't rsync `profiles/` across machines**.
 
 ## Troubleshooting
@@ -365,7 +370,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-# Refresh usage before launch to avoid first-call wall-hits (cold-start protection)
+# Optional: refresh usage at service start instead of making the first request pay preflight latency.
 ExecStartPre=/root/.cargo/bin/kiro-pool usage --update-state
 ExecStart=/root/.cargo/bin/openab
 Environment=KIRO_POOL_DIR=/root/.kiro-pool
@@ -377,7 +382,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-`ExecStartPre` queries every profile's credit usage and writes it to `state.json` before openab starts (including on crash-restart). This way kiro-wrap's pick can skip already-exhausted profiles immediately, instead of waiting for the first wall-hit to learn passively.
+`ExecStartPre` queries every profile's credit usage and writes it to `state.json` before openab starts (including on crash-restart). `kiro-wrap` also has lazy usage preflight before automatic picks, so this line is mainly a latency placement choice: boot-time refresh vs. first-request refresh.
 
 > **After editing the unit file you must reload:**
 > ```bash
@@ -419,7 +424,7 @@ If the user's intent is ambiguous, ask **one** clarifying question. Do not assum
 4. **Do not commit `.kiro-pool/` to any repo.** It contains auth material.
 5. **Do not pass flags to `kiro-wrap` itself** — every flag is forwarded to `kiro-cli`. Use env vars for pool config: `KIRO_POOL_DIR`, `KIRO_POOL_PROFILE`, `KIRO_WRAP_NO_STDOUT_TEE`.
 6. **`HOME` must be set in the calling environment** when invoking `kiro-wrap` from systemd / cron / openab. Missing `HOME` = hard error at startup. Always set it explicitly.
-7. **Cold-start usage refresh is mandatory** after any fresh install or `state.json` wipe — run `kiro-pool usage --update-state` once before the first real session, otherwise the first pick may hit an exhausted profile and crash.
+7. **Usage data should be fresh before real traffic.** kiro-wrap performs lazy preflight before automatic picks by default; for deployments, run `kiro-pool usage --update-state` at boot if you want refresh latency to happen before the first user request.
 8. **One AWS account = one profile on one host.** Do not log the same account into two pools on different hosts simultaneously — kiro-cli's session state will diverge and one side will silently break.
 9. **Inside kiro-wrap, `$HOME` is the Kiro profile HOME.** If an external tool needs the real user's global credentials or config, use `KIRO_REAL_HOME` explicitly, for example `HOME="$KIRO_REAL_HOME" gh auth status`. Do not copy broad dotfile trees into profile homes as a default fix.
 
@@ -437,7 +442,7 @@ kiro-pool login a --tier free   # or --tier student / pro / pro+ / power as appr
 
 # 4. Verify
 kiro-pool doctor
-kiro-pool usage --update-state  # mandatory cold-start refresh
+kiro-pool usage --update-state  # recommended cold-start refresh; wrap also has lazy preflight
 kiro-pool list                  # confirm STATUS=idle, USAGE shown
 
 # 5. Use it
@@ -468,7 +473,7 @@ This is the most error-prone path. The four common failure modes:
 | "Connection Lost" / silent fail at session start | Caller's env missing `HOME` | check the systemd unit / openab config | add `HOME=/<user-home>` to env |
 | `gh` / `git` / `ssh` sees a blank user config | Agent tool shell runs with the profile HOME by design | `echo "$HOME"; echo "$KIRO_REAL_HOME"` inside the agent | teach the agent to use `HOME="$KIRO_REAL_HOME" <tool>` when it needs user-level credentials |
 | `kiro-cli` not found / no such file | systemd `User=` differs from cargo install user | `which kiro-wrap` as the systemd user | use absolute path `/<home>/.cargo/bin/kiro-wrap` everywhere; never rely on PATH |
-| First request after restart errors with `-32603` | No usage refresh done at boot | check `state.json` for empty `last_usage` | add `ExecStartPre=/<home>/.cargo/bin/kiro-pool usage --update-state` to systemd unit |
+| First request after restart errors with `-32603` | Usage preflight was disabled, failed, or cached data was still stale | check `state.json` for empty/stale `last_usage` and service stderr for `usage preflight` | keep lazy preflight enabled, or add `ExecStartPre=/<home>/.cargo/bin/kiro-pool usage --update-state` to systemd unit |
 | `flock timeout` / pick fails | Wrong owner on `~/.kiro-pool/` | `ls -la ~/.kiro-pool/state.json` | `chown -R <systemd-user>:<group> ~/.kiro-pool/`; never run `kiro-pool` as root if openab runs as a non-root user (or vice versa) |
 
 Standard VPS deploy checklist (do these in order, do not skip):
@@ -479,7 +484,7 @@ Standard VPS deploy checklist (do these in order, do not skip):
 4. As `$U`: `cargo install --path .` (or copy prebuilt binary into `~/.cargo/bin/`).
 5. `kiro-pool login <name> --tier <tier>` for each account. On a headless VPS with Google/GitHub: kiro-cli ≥ 2.1 prints a device-flow URL (`app.kiro.dev/account/device?user_code=...`) — open it in any browser (laptop, phone) and confirm. No SSH tunnel needed.
 6. `kiro-pool doctor` — must be all `[OK]`.
-7. `kiro-pool usage --update-state` — mandatory cold-start.
+7. `kiro-pool usage --update-state` — recommended cold-start refresh; lazy preflight also runs before automatic picks.
 8. Wire up the integration. For openab + systemd, see the [Full systemd example](#full-systemd-example) section above. **Always include both `KIRO_POOL_DIR` and `HOME` in `Environment=`**.
 9. After editing the systemd unit, **always** `sudo systemctl daemon-reload && sudo systemctl restart <unit>`. Skipping `daemon-reload` will silently use the old unit.
 10. Tail logs after starting: `journalctl -u <unit> -f` until you see a successful first request.

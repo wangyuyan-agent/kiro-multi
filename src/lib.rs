@@ -23,6 +23,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LOG_KEEP: usize = 50;
 /// state.json flock 等待上限（毫秒）。
 pub const DEFAULT_FLOCK_TIMEOUT_MS: u64 = 5000;
+/// kiro-wrap pick 前自动刷新 usage 的默认 TTL（秒）。
+pub const DEFAULT_USAGE_PREFLIGHT_TTL_SECS: u64 = 300;
+/// usage preflight 独立锁的默认等待上限（毫秒）。
+pub const DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS: u64 = 60000;
 /// 默认 cooldown 判定正则。
 pub const DEFAULT_COOLDOWN_REGEX: &str = r"(?i)(concurrent|too many|retry in \d+\s?(?:min|minutes?|s|sec|seconds?)|throttl|rate[\s-]?limit|try again later|quota|exceeded)";
 

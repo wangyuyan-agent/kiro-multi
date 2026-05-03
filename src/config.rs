@@ -2,7 +2,7 @@
 
 use crate::{
     DEFAULT_COOLDOWN_REGEX, DEFAULT_ERROR_COOLDOWN_MIN, DEFAULT_FLOCK_TIMEOUT_MS, DEFAULT_LOG_KEEP,
-    ZOMBIE_MINUTES,
+    DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS, DEFAULT_USAGE_PREFLIGHT_TTL_SECS, ZOMBIE_MINUTES,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -16,6 +16,9 @@ pub struct Config {
     pub cooldown_regex: String,
     pub log_keep: usize,
     pub flock_timeout_ms: u64,
+    pub usage_preflight_enabled: bool,
+    pub usage_preflight_ttl_secs: u64,
+    pub usage_preflight_lock_timeout_ms: u64,
     /// tier → model 注入表。wrap pick 到 profile 时，若用户未显式 --model，
     /// 则按 picked.kind 查表插入。缺表 / 缺键时不注入（让 kiro-cli 走 settings 默认）。
     pub tier_model: BTreeMap<String, String>,
@@ -29,6 +32,9 @@ impl Default for Config {
             cooldown_regex: DEFAULT_COOLDOWN_REGEX.to_string(),
             log_keep: DEFAULT_LOG_KEEP,
             flock_timeout_ms: DEFAULT_FLOCK_TIMEOUT_MS,
+            usage_preflight_enabled: true,
+            usage_preflight_ttl_secs: DEFAULT_USAGE_PREFLIGHT_TTL_SECS,
+            usage_preflight_lock_timeout_ms: DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS,
             tier_model: BTreeMap::new(),
         }
     }
@@ -46,6 +52,12 @@ struct Raw {
     log_keep: Option<usize>,
     #[serde(default)]
     flock_timeout_ms: Option<u64>,
+    #[serde(default)]
+    usage_preflight_enabled: Option<bool>,
+    #[serde(default)]
+    usage_preflight_ttl_secs: Option<u64>,
+    #[serde(default)]
+    usage_preflight_lock_timeout_ms: Option<u64>,
     #[serde(default)]
     tier_model: Option<BTreeMap<String, String>>,
 }
@@ -67,6 +79,15 @@ impl Config {
             cooldown_regex: raw.cooldown_regex.unwrap_or(d.cooldown_regex),
             log_keep: raw.log_keep.unwrap_or(d.log_keep),
             flock_timeout_ms: raw.flock_timeout_ms.unwrap_or(d.flock_timeout_ms),
+            usage_preflight_enabled: raw
+                .usage_preflight_enabled
+                .unwrap_or(d.usage_preflight_enabled),
+            usage_preflight_ttl_secs: raw
+                .usage_preflight_ttl_secs
+                .unwrap_or(d.usage_preflight_ttl_secs),
+            usage_preflight_lock_timeout_ms: raw
+                .usage_preflight_lock_timeout_ms
+                .unwrap_or(d.usage_preflight_lock_timeout_ms),
             tier_model: raw.tier_model.unwrap_or_default(),
         })
     }

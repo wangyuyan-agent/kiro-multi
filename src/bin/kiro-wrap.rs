@@ -1,23 +1,26 @@
 //! kiro-wrap: pick → exec kiro-cli → release / cooldown。
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use kiro_pool::{
     config::Config,
+    fetch_profile_usage,
     pick::{pick, Picked},
     profile_home, resolve_pool_dir, rotate_logs,
-    state::with_state,
-    STDERR_RING_CAP,
+    state::{read_state, with_state},
+    State, STDERR_RING_CAP,
 };
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 fn main() -> ExitCode {
     match run() {
@@ -96,6 +99,118 @@ fn configure_child_command(
         .env("KIRO_PROFILE_HOME", effective_home);
 }
 
+fn maybe_refresh_usage_before_pick(pool_dir: &Path, cfg: &Config) {
+    if !cfg.usage_preflight_enabled {
+        return;
+    }
+    if let Err(e) = refresh_usage_before_pick(pool_dir, cfg) {
+        eprintln!("kiro-wrap: usage preflight skipped: {e:#}");
+    }
+}
+
+fn refresh_usage_before_pick(pool_dir: &Path, cfg: &Config) -> Result<()> {
+    let state = read_state(pool_dir)?;
+    let mut names = usage_preflight_names(&state, Utc::now(), cfg.usage_preflight_ttl_secs);
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let Some(lock) = acquire_usage_preflight_lock(pool_dir, cfg.usage_preflight_lock_timeout_ms)?
+    else {
+        eprintln!("kiro-wrap: usage preflight already running; using cached usage");
+        return Ok(());
+    };
+
+    let state = read_state(pool_dir)?;
+    names = usage_preflight_names(&state, Utc::now(), cfg.usage_preflight_ttl_secs);
+    if names.is_empty() {
+        let _ = lock.unlock();
+        return Ok(());
+    }
+
+    eprintln!(
+        "kiro-wrap: usage preflight refreshing {} stale idle profile(s)",
+        names.len()
+    );
+    let mut fetched = Vec::new();
+    for name in names {
+        match fetch_profile_usage(pool_dir, &name) {
+            Some(usage) => fetched.push((name, usage)),
+            None => eprintln!("kiro-wrap: usage preflight failed for {name}; keeping cached usage"),
+        }
+    }
+
+    if !fetched.is_empty() {
+        with_state(pool_dir, |s| {
+            for (name, usage) in &fetched {
+                if let Some(p) = s.profiles.get_mut(name) {
+                    p.last_usage = Some(usage.clone());
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let _ = lock.unlock();
+    Ok(())
+}
+
+fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Vec<String> {
+    let ttl = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+    state
+        .order
+        .iter()
+        .filter(|name| {
+            let Some(profile) = state.profiles.get(*name) else {
+                return false;
+            };
+            if profile.in_use_since.is_some() {
+                return false;
+            }
+            if profile.cooldown_until.is_some_and(|cd| cd > now) {
+                return false;
+            }
+            match profile
+                .last_usage
+                .as_ref()
+                .and_then(|usage| usage.updated_at)
+            {
+                None => true,
+                Some(updated_at) => ttl_secs == 0 || now.signed_duration_since(updated_at) >= ttl,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn acquire_usage_preflight_lock(pool_dir: &Path, timeout_ms: u64) -> Result<Option<File>> {
+    fs::create_dir_all(pool_dir)?;
+    let lock_path = pool_dir.join("usage-refresh.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    let deadline = Instant::now() + StdDuration::from_millis(timeout_ms);
+
+    loop {
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => return Ok(Some(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(None);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(std::cmp::min(StdDuration::from_millis(100), remaining));
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("try_lock_exclusive")),
+        }
+    }
+}
+
 fn run() -> Result<ExitCode> {
     ensure_home();
     let real_home = std::env::var("HOME").context("HOME not set after ensure_home")?;
@@ -112,7 +227,12 @@ fn run() -> Result<ExitCode> {
         );
     }
 
-    let pick_res = if let Ok(forced) = std::env::var("KIRO_POOL_PROFILE") {
+    let forced_profile = std::env::var("KIRO_POOL_PROFILE").ok();
+    if forced_profile.is_none() {
+        maybe_refresh_usage_before_pick(&pool_dir, &cfg);
+    }
+
+    let pick_res = if let Some(forced) = forced_profile {
         // 指定 profile，跳過輪轉，但仍標 in_use_since
         with_state(&pool_dir, |s| {
             let p = s
@@ -452,11 +572,20 @@ fn log_cooldown(
 
 #[cfg(test)]
 mod tests {
-    use super::{configure_child_command, inject_default_subcmd};
+    use super::{configure_child_command, inject_default_subcmd, usage_preflight_names};
+    use chrono::{Duration, Utc};
+    use kiro_pool::{Profile, ProfileUsage, State};
     use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn usage_at(updated_at: chrono::DateTime<Utc>) -> ProfileUsage {
+        ProfileUsage {
+            updated_at: Some(updated_at),
+            ..ProfileUsage::default()
+        }
     }
 
     #[test]
@@ -536,5 +665,75 @@ mod tests {
                 .collect::<Vec<_>>(),
             args
         );
+    }
+
+    #[test]
+    fn usage_preflight_refreshes_only_stale_idle_profiles() {
+        let now = Utc::now();
+        let mut state = State {
+            order: vec![
+                "fresh".to_string(),
+                "stale".to_string(),
+                "missing".to_string(),
+                "busy".to_string(),
+                "cooldown".to_string(),
+            ],
+            ..State::default()
+        };
+        state.profiles.insert(
+            "fresh".to_string(),
+            Profile {
+                last_usage: Some(usage_at(now - Duration::seconds(30))),
+                ..Profile::default()
+            },
+        );
+        state.profiles.insert(
+            "stale".to_string(),
+            Profile {
+                last_usage: Some(usage_at(now - Duration::minutes(10))),
+                ..Profile::default()
+            },
+        );
+        state
+            .profiles
+            .insert("missing".to_string(), Profile::default());
+        state.profiles.insert(
+            "busy".to_string(),
+            Profile {
+                in_use_since: Some(now),
+                last_usage: Some(usage_at(now - Duration::minutes(10))),
+                ..Profile::default()
+            },
+        );
+        state.profiles.insert(
+            "cooldown".to_string(),
+            Profile {
+                cooldown_until: Some(now + Duration::minutes(5)),
+                last_usage: Some(usage_at(now - Duration::minutes(10))),
+                ..Profile::default()
+            },
+        );
+
+        let names = usage_preflight_names(&state, now, 300);
+
+        assert_eq!(names, vec!["stale".to_string(), "missing".to_string()]);
+    }
+
+    #[test]
+    fn usage_preflight_ttl_zero_refreshes_any_idle_profile() {
+        let now = Utc::now();
+        let mut state = State {
+            order: vec!["fresh".to_string()],
+            ..State::default()
+        };
+        state.profiles.insert(
+            "fresh".to_string(),
+            Profile {
+                last_usage: Some(usage_at(now)),
+                ..Profile::default()
+            },
+        );
+
+        assert_eq!(usage_preflight_names(&state, now, 0), vec!["fresh"]);
     }
 }
