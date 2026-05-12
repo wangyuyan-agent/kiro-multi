@@ -357,6 +357,7 @@ This means the pool never refuses service just because concurrency exceeds the p
 | kiro-cli login hangs (VPS) | n/a in v0.2.0+ — Kiro CLI ≥ 2.1 uses device flow, no callback listener | open the printed `app.kiro.dev/account/device?user_code=...` URL in any browser to confirm |
 | "flock timeout" | another process is holding the state lock | check for zombie wrap processes; `kill` them or wait for `zombie_minutes` to elapse |
 | Profile still shown 100% after the reset day | `resets_at` in state.json hasn't actually passed yet | normally pick auto-checks `resets_at` and unfreezes; if the date is wrong, refresh with `kiro-pool usage --update-state` |
+| macOS asks for the `security` / `login` keychain password | a per-profile keychain is locked, usually from an older build or a stale exhausted-account path | upgrade to ≥ v0.2.4 and run `kiro-wrap` once; it unlocks the profile keychain with the expected empty password and reapplies no-timeout settings |
 | macOS `security` keeps polluting the user keychain search list | older versions of this tool ran `security` without isolating HOME | `kiro-pool fix-keychain` to scrub; new builds (≥ v0.1.0) prevent it at the source |
 
 ### Full systemd example

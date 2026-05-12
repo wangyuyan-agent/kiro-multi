@@ -183,6 +183,7 @@ pub fn ensure_keychain(profile_home: &Path) -> Result<()> {
             .args(["create-keychain", "-p", ""])
             .arg(&kc)
             .env("HOME", profile_home)
+            .stdin(std::process::Stdio::null())
             .status()
             .with_context(|| "spawn security create-keychain")?
             .success();
@@ -192,22 +193,34 @@ pub fn ensure_keychain(profile_home: &Path) -> Result<()> {
                 kc.display()
             ));
         }
-        let _ = std::process::Command::new("security")
-            .args(["set-keychain-settings"])
-            .arg(&kc)
-            .env("HOME", profile_home)
-            .status();
     }
+
     let ok = std::process::Command::new("security")
         .args(["unlock-keychain", "-p", ""])
         .arg(&kc)
         .env("HOME", profile_home)
+        .stdin(std::process::Stdio::null())
         .status()
         .with_context(|| "spawn security unlock-keychain")?
         .success();
     if !ok {
         return Err(anyhow!(
-            "security unlock-keychain failed for {}",
+            "security unlock-keychain failed for {}; this profile keychain should use an empty password, so try `kiro-pool logout <name>` and login again if it was created by hand",
+            kc.display()
+        ));
+    }
+
+    let ok = std::process::Command::new("security")
+        .args(["set-keychain-settings"])
+        .arg(&kc)
+        .env("HOME", profile_home)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .with_context(|| "spawn security set-keychain-settings")?
+        .success();
+    if !ok {
+        return Err(anyhow!(
+            "security set-keychain-settings failed for {}",
             kc.display()
         ));
     }

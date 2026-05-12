@@ -353,6 +353,7 @@ kiro-pool remove A --purge   # 带交互确认；非 TTY 会直接删
 | kiro-cli 登录卡住不动（VPS） | v0.2.0+ 不会出现 — Kiro CLI ≥ 2.1 走 device flow，不用 callback listener | 在任意浏览器打开打印出来的 `app.kiro.dev/account/device?user_code=...` URL 确认即可 |
 | "flock timeout" | 另一个进程持有 state 锁超时 | 检查是否有 zombie wrap 进程；`kill` 掉或等 zombie_minutes 过期自动回收 |
 | profile 月初仍被标为 100% | state.json 里的 resets_at 还没到 | 正常情况 pick 会自动检查 resets_at 并解禁；如果日期不对，手动 `kiro-pool usage --update-state` 刷新 |
+| macOS 弹出 `security` / `login` 钥匙串密码框 | 某个 per-profile keychain 被锁住，常见于旧版本或 quota 耗尽后的异常路径 | 升级到 ≥ v0.2.4 后跑一次 `kiro-wrap`；它会用预期的空密码解锁该 profile keychain，并重新设置 no-timeout |
 
 ### systemd 完整范例
 
