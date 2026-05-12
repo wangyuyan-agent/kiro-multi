@@ -130,6 +130,11 @@ pub fn profile_home(pool_dir: &Path, name: &str) -> PathBuf {
     pool_dir.join("profiles").join(name)
 }
 
+/// 给定 profile HOME，返回该 profile 内 kiro-cli 使用的 KIRO_HOME。
+pub fn profile_kiro_home(profile_home: &Path) -> PathBuf {
+    profile_home.join(".kiro")
+}
+
 /// kiro-cli 数据目录相对 HOME 的子路径（跨平台差异）。
 /// macOS: `Library/Application Support/kiro-cli`
 /// Linux / 其他 Unix: `.local/share/kiro-cli`（XDG_DATA_HOME 惯例）
@@ -418,9 +423,11 @@ pub const USAGE_FETCH_TIMEOUT_SECS: u64 = 30;
 /// 過期要交互登錄）讓 `kiro-pool usage` / `list --refresh-usage` 整條命令 hang。
 pub fn fetch_profile_usage(pool_dir: &Path, name: &str) -> Option<ProfileUsage> {
     let home = profile_home(pool_dir, name);
+    let kiro_home = profile_kiro_home(&home);
     let mut child = std::process::Command::new("kiro-cli")
         .args(["chat", "--no-interactive", "/usage"])
         .env("HOME", &home)
+        .env("KIRO_HOME", &kiro_home)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -195,6 +195,7 @@ kiro-wrap 注入给子进程 `kiro-cli` 的 env：
 
 | env | 作用 |
 |---|---|
+| `KIRO_HOME` | 对子进程 `kiro-cli` 会被忽略/覆盖；kiro-wrap 会固定到当前 profile 的 `.kiro`，保证 session/config 隔离 |
 | `KIRO_REAL_HOME` | kiro-wrap 改写前的调用方真实 HOME |
 | `KIRO_PROFILE_HOME` | 本次 session 实际使用的 Kiro profile HOME，shared 模式下会是 `__shared_<pid>` 临时 HOME |
 
@@ -208,7 +209,7 @@ kiro-wrap 注入给子进程 `kiro-cli` 的 env：
 - stdin `inherit`；stderr 永远被 tee（64 KiB 环形缓冲供 cooldown 判定）；stdout 在 TTY 下 `inherit`（保留交互 chat 原样），非 TTY（openab / ACP / pipeline）下也 tee 一份进环形缓冲，防止 kiro-cli 把 rate-limit 报错写到 stdout 而被漏判。
 - 退出码透传子进程；被信号杀时返回 `128 + signum`。
 - SIGINT / SIGTERM / SIGHUP 会转发给子进程（不自己吞）。
-- env：`KIRO_POOL_DIR` 覆盖默认 `~/.kiro-pool`；`HOME` 会被 wrap 重写成 `<pool>/profiles/<picked>`；`KIRO_REAL_HOME` / `KIRO_PROFILE_HOME` 会把改写前后的两个 HOME 暴露给 agent。
+- env：`KIRO_POOL_DIR` 覆盖默认 `~/.kiro-pool`；`HOME` 会被 wrap 重写成 `<pool>/profiles/<picked>`；`KIRO_HOME` 固定为 `<effective-profile-home>/.kiro`；`KIRO_REAL_HOME` / `KIRO_PROFILE_HOME` 会把改写前后的两个 HOME 暴露给 agent。
 - **HOME 防御**：如果启动时 `HOME` 未设，会尝试从 `getpwuid` 获取；仍然失败则打明确错误退出（避免 openab 等调用方忘记传 HOME 导致静默失败）。
 
 **流程**：
@@ -216,7 +217,7 @@ kiro-wrap 注入给子进程 `kiro-cli` 的 env：
 1. 如果没有强制 `KIRO_POOL_PROFILE`，先按 `usage_preflight_ttl_secs` 刷新空闲、非 cooldown profile 的陈旧 usage
 2. 原子 pick 一个档位最低的可用 profile，标 `in_use_since`（flock 保护）
 3. 补齐 per-profile keychain + runtime symlink（`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`）
-4. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`
+4. `spawn HOME=<effective-profile-home> KIRO_HOME=<effective-profile-home>/.kiro KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`
 5. 子进程退出时：
    - stderr tail（非 TTY 场景也包含 stdout tail）匹配 `cooldown_regex` → 设 cooldown 并把 tail 落到 `logs/<name>-<pid>-<ts>.log`；logs 按 `log_keep` 自动轮转
    - 检测到 quota 耗尽信号（`-32603` / `Internal error`）→ 额外标记 `last_usage = 100%`，后续 pick 跳过

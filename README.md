@@ -197,6 +197,7 @@ Exported to the child `kiro-cli` process:
 
 | env | effect |
 |---|---|
+| `KIRO_HOME` | ignored/overridden for child `kiro-cli`; kiro-wrap pins it to the active profile's `.kiro` to preserve session/config isolation |
 | `KIRO_REAL_HOME` | the caller's real HOME before kiro-wrap rewrites it |
 | `KIRO_PROFILE_HOME` | the effective Kiro profile HOME assigned to this session, including `__shared_<pid>` homes |
 
@@ -211,7 +212,7 @@ A transparent shim around `kiro-cli` that lifts the "which account?" decision ou
 - stdin: `inherit`. stderr: always teed (64 KiB ring buffer drives cooldown detection). stdout: `inherit` on a TTY (preserves interactive chat); on non-TTY (openab / ACP / pipelines) also teed into the ring buffer so kiro-cli can't sneak a rate-limit message past us via stdout.
 - Exit code is propagated; killed-by-signal returns `128 + signum`.
 - SIGINT / SIGTERM / SIGHUP are forwarded to the child (not swallowed).
-- env: `KIRO_POOL_DIR` overrides the default `~/.kiro-pool`; `HOME` is rewritten to `<pool>/profiles/<picked>` for the child; `KIRO_REAL_HOME` and `KIRO_PROFILE_HOME` expose both sides of that rewrite to the agent.
+- env: `KIRO_POOL_DIR` overrides the default `~/.kiro-pool`; `HOME` is rewritten to `<pool>/profiles/<picked>` for the child; `KIRO_HOME` is pinned to `<effective-profile-home>/.kiro`; `KIRO_REAL_HOME` and `KIRO_PROFILE_HOME` expose both sides of that rewrite to the agent.
 - **HOME defence**: if `HOME` is unset at startup, kiro-wrap tries `getpwuid` first; if that also fails, it exits with a clear error rather than silently failing inside setup (a common openab footgun).
 
 **Flow**:
@@ -219,7 +220,7 @@ A transparent shim around `kiro-cli` that lifts the "which account?" decision ou
 1. If no `KIRO_POOL_PROFILE` is forced, refresh stale usage for idle, non-cooldown profiles according to `usage_preflight_ttl_secs`.
 2. Atomically pick the lowest-tier available profile, mark `in_use_since` (flock-protected).
 3. Materialize per-profile keychain + runtime symlinks (`bun` / `tui.js` / `shell/` / `~/.local/bin/kiro-cli{,-chat,-term}`).
-4. `spawn HOME=<effective-profile-home> KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`.
+4. `spawn HOME=<effective-profile-home> KIRO_HOME=<effective-profile-home>/.kiro KIRO_REAL_HOME=<caller-home> KIRO_PROFILE_HOME=<effective-profile-home> kiro-cli <args...>`.
 5. On child exit:
    - If the stderr tail (and stdout tail in non-TTY mode) matches `cooldown_regex` → set cooldown and dump the tail to `logs/<name>-<pid>-<ts>.log`. Logs auto-rotate at `log_keep`.
    - If a quota-exhaustion signal (`-32603` / `Internal error`) is detected → also mark `last_usage = 100%` so future picks skip the profile.

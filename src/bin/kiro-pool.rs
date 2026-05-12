@@ -8,7 +8,8 @@ use kiro_pool::{
     config::Config,
     fetch_profile_usage, parse_duration,
     pick::pick,
-    profile_home, profile_license, profile_sqlite, resolve_pool_dir, rotate_logs,
+    profile_home, profile_kiro_home, profile_license, profile_sqlite, resolve_pool_dir,
+    rotate_logs,
     state::{read_state, with_state},
     valid_profile_name, Profile,
 };
@@ -267,6 +268,7 @@ fn cmd_login(
         ));
     }
     let home = profile_home(pool_dir, name);
+    let kiro_home = profile_kiro_home(&home);
     kiro_pool::ensure_keychain(&home)?;
     kiro_pool::ensure_shared_assets(&home)?;
     kiro_pool::ensure_sibling_binaries(&home)?;
@@ -277,6 +279,7 @@ fn cmd_login(
         .arg("--region")
         .arg(region)
         .env("HOME", &home)
+        .env("KIRO_HOME", &kiro_home)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -311,6 +314,7 @@ fn cmd_login(
     let ts = Command::new("kiro-cli")
         .args(["settings", "toolSearch.enabled", "true"])
         .env("HOME", &home)
+        .env("KIRO_HOME", &kiro_home)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

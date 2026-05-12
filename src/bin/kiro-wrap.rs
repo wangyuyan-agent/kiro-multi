@@ -7,7 +7,7 @@ use kiro_pool::{
     config::Config,
     fetch_profile_usage,
     pick::{pick, Picked},
-    profile_home, resolve_pool_dir, rotate_logs,
+    profile_home, profile_kiro_home, resolve_pool_dir, rotate_logs,
     state::{read_state, with_state},
     ProfileUsage, State, STDERR_RING_CAP,
 };
@@ -95,6 +95,7 @@ fn configure_child_command(
 ) {
     cmd.args(args)
         .env("HOME", effective_home)
+        .env("KIRO_HOME", profile_kiro_home(effective_home))
         .env("KIRO_REAL_HOME", real_home)
         .env("KIRO_PROFILE_HOME", effective_home);
 }
@@ -677,6 +678,11 @@ mod tests {
         assert_eq!(
             envs.get(&OsString::from("HOME")).and_then(|v| v.as_ref()),
             Some(&profile_home.clone().into_os_string())
+        );
+        assert_eq!(
+            envs.get(&OsString::from("KIRO_HOME"))
+                .and_then(|v| v.as_ref()),
+            Some(&profile_home.join(".kiro").into_os_string())
         );
         assert_eq!(
             envs.get(&OsString::from("KIRO_PROFILE_HOME"))
