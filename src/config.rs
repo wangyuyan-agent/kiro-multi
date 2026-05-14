@@ -2,7 +2,9 @@
 
 use crate::{
     DEFAULT_COOLDOWN_REGEX, DEFAULT_ERROR_COOLDOWN_MIN, DEFAULT_FLOCK_TIMEOUT_MS, DEFAULT_LOG_KEEP,
-    DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS, DEFAULT_USAGE_PREFLIGHT_TTL_SECS, ZOMBIE_MINUTES,
+    DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS, DEFAULT_USAGE_PREFLIGHT_MAX_PARALLEL,
+    DEFAULT_USAGE_PREFLIGHT_STALE_FORCE_REFRESH_HOURS, DEFAULT_USAGE_PREFLIGHT_TTL_SECS,
+    ZOMBIE_MINUTES,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -19,6 +21,11 @@ pub struct Config {
     pub usage_preflight_enabled: bool,
     pub usage_preflight_ttl_secs: u64,
     pub usage_preflight_lock_timeout_ms: u64,
+    /// preflight 并发上限：同时跑几个 kiro-cli /usage 子进程。最小 1（=串行）。
+    pub usage_preflight_max_parallel: usize,
+    /// used_percent ≥ 100 且 resets_at 缺失时，距离 last_usage.updated_at 超过这个
+    /// 小时数就强制 refresh 一次。0 表示永远不强制刷新（回到 v0.2.4 之前的行为）。
+    pub usage_preflight_stale_force_refresh_hours: u64,
     /// tier → model 注入表。wrap pick 到 profile 时，若用户未显式 --model，
     /// 则按 picked.kind 查表插入。缺表 / 缺键时不注入（让 kiro-cli 走 settings 默认）。
     pub tier_model: BTreeMap<String, String>,
@@ -35,6 +42,9 @@ impl Default for Config {
             usage_preflight_enabled: true,
             usage_preflight_ttl_secs: DEFAULT_USAGE_PREFLIGHT_TTL_SECS,
             usage_preflight_lock_timeout_ms: DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS,
+            usage_preflight_max_parallel: DEFAULT_USAGE_PREFLIGHT_MAX_PARALLEL,
+            usage_preflight_stale_force_refresh_hours:
+                DEFAULT_USAGE_PREFLIGHT_STALE_FORCE_REFRESH_HOURS,
             tier_model: BTreeMap::new(),
         }
     }
@@ -58,6 +68,10 @@ struct Raw {
     usage_preflight_ttl_secs: Option<u64>,
     #[serde(default)]
     usage_preflight_lock_timeout_ms: Option<u64>,
+    #[serde(default)]
+    usage_preflight_max_parallel: Option<usize>,
+    #[serde(default)]
+    usage_preflight_stale_force_refresh_hours: Option<u64>,
     #[serde(default)]
     tier_model: Option<BTreeMap<String, String>>,
 }
@@ -88,6 +102,12 @@ impl Config {
             usage_preflight_lock_timeout_ms: raw
                 .usage_preflight_lock_timeout_ms
                 .unwrap_or(d.usage_preflight_lock_timeout_ms),
+            usage_preflight_max_parallel: raw
+                .usage_preflight_max_parallel
+                .unwrap_or(d.usage_preflight_max_parallel),
+            usage_preflight_stale_force_refresh_hours: raw
+                .usage_preflight_stale_force_refresh_hours
+                .unwrap_or(d.usage_preflight_stale_force_refresh_hours),
             tier_model: raw.tier_model.unwrap_or_default(),
         })
     }

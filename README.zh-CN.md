@@ -127,7 +127,7 @@ kiro-pool usage student_1          # 只查某个 profile
 **Quota 耗尽自动处理**：
 
 - **被动学习**：kiro-wrap 在 session 结束时如果检测到 quota 相关错误（`-32603 Internal error` 等），会自动把该 profile 标记为 100% 用尽，后续 pick 跳过。第一次撞墙即学会，无需预先查询。
-- **懒 preflight**：自动 pick 前，kiro-wrap 会按 TTL 刷新空闲、非 cooldown profile 的陈旧 usage。已知 100% 的 profile 会跳过，直到 reset day 再刷新解禁。默认 5 分钟 TTL，并用独立的 `usage-refresh.lock` 避免并发刷新风暴。
+- **懒 preflight**：自动 pick 前，kiro-wrap 会并发刷新空闲、非 cooldown profile 的陈旧 usage（并发上限由 `usage_preflight_max_parallel` 控制，默认 4）。已知 100% 的 profile 会跳过，直到 reset day 再刷新解禁；如果 `resets_at` 缺失，则在 `usage_preflight_stale_force_refresh_hours`（默认 24h）后强制重新核查，避免数据残缺导致 profile 被永久冻结。默认 5 分钟 TTL，并用独立的 `usage-refresh.lock` 避免并发刷新风暴。
 - **月初自动解禁**：pick 时如果 `resets_at` 日期已过（月初 quota 重置），自动忽略旧的 100% 标记，允许重新 pick。
 - **冷启动保护**：全新 `state.json` 的首次自动 pick 会由懒 preflight 补 usage。systemd 里保留 `ExecStartPre=/path/to/kiro-pool usage --update-state` 仍然有价值，它只是把刷新延迟放到服务启动时，而不是第一个用户请求上。
 
@@ -167,6 +167,8 @@ flock_timeout_ms          = 5000      # flock 拿不到锁时的轮询上限（�
 usage_preflight_enabled   = true      # kiro-wrap 自动 pick 前刷新陈旧的空闲 profile usage
 usage_preflight_ttl_secs  = 300       # cached usage 超过这个秒数才刷新
 usage_preflight_lock_timeout_ms = 60000 # 另一个 preflight 正在刷新时最多等待多久
+usage_preflight_max_parallel = 4      # preflight 并发上限：同时跑几个 kiro-cli /usage 子进程（≥1）
+usage_preflight_stale_force_refresh_hours = 24 # 100% 用尽且 resets_at 缺失时，超过这个小时数就强制 refresh（0 = 永远不强制）
 
 # tier → kiro-cli 默认 model 映射。wrap 会在 pick 到 profile 后，按 kind 自动注入
 # `--model <X>`，让不同档位账号用不同的 default model（settings/cli.json 是全池共享的，
@@ -190,6 +192,7 @@ power   = "claude-opus-4.6"
 | `KIRO_POOL_DIR` | 覆盖默认 `~/.kiro-pool` |
 | `KIRO_POOL_PROFILE` | 指定使用某个 profile，跳过轮转（仍标 in_use / release） |
 | `KIRO_WRAP_NO_STDOUT_TEE=1` | 强制 stdout 直接 `inherit`，不走 tee+ring。ACP 子命令已经自动走这条路径，其他 pipeline 场景遇到握手超时可手动打开 |
+| `KIRO_WRAP_QUIET_PREFLIGHT=1` | 即使在 TTY 下也静默 preflight info。默认行为：stderr 是 TTY 时打印 `kiro-wrap: usage preflight ...` 进度，非 TTY（openab / systemd / pipeline）下静默；设为非空非 `0` 则任何场景都静默。warning（fetch 失败）不受影响。 |
 
 kiro-wrap 注入给子进程 `kiro-cli` 的 env：
 

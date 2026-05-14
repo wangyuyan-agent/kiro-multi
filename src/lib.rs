@@ -27,6 +27,11 @@ pub const DEFAULT_FLOCK_TIMEOUT_MS: u64 = 5000;
 pub const DEFAULT_USAGE_PREFLIGHT_TTL_SECS: u64 = 300;
 /// usage preflight 独立锁的默认等待上限（毫秒）。
 pub const DEFAULT_USAGE_PREFLIGHT_LOCK_TIMEOUT_MS: u64 = 60000;
+/// usage preflight 并行 fetch 的默认上限（同时跑几个 kiro-cli /usage 子进程）。
+pub const DEFAULT_USAGE_PREFLIGHT_MAX_PARALLEL: usize = 4;
+/// 已耗尽（used_percent ≥ 100）且没有 resets_at 的 profile，在多少小时后强制
+/// preflight 重刷一次，避免数据异常导致 profile 永久卡死。
+pub const DEFAULT_USAGE_PREFLIGHT_STALE_FORCE_REFRESH_HOURS: u64 = 24;
 /// 默认 cooldown 判定正则。
 pub const DEFAULT_COOLDOWN_REGEX: &str = r"(?i)(concurrent|too many|retry in \d+\s?(?:min|minutes?|s|sec|seconds?)|throttl|rate[\s-]?limit|try again later|quota|exceeded)";
 

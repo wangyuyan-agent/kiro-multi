@@ -127,7 +127,7 @@ kiro-pool usage student_1          # one profile only
 **Quota exhaustion handled automatically**:
 
 - **Passive learning**: when a session ends, kiro-wrap inspects the stderr tail for quota signals (`-32603 Internal error` etc.) and marks the profile at 100%. Subsequent picks skip it. One mistake is enough — no preflight needed.
-- **Lazy preflight**: before an automatic pick, kiro-wrap refreshes stale usage for idle, non-cooldown profiles. Known 100% profiles are skipped until their reset day. The default TTL is 5 minutes and a separate `usage-refresh.lock` prevents concurrent refresh storms.
+- **Lazy preflight**: before an automatic pick, kiro-wrap refreshes stale usage for idle, non-cooldown profiles in parallel (up to `usage_preflight_max_parallel` workers, default 4). Known 100% profiles are skipped until their reset day; if `resets_at` is missing they're re-checked after `usage_preflight_stale_force_refresh_hours` (default 24h) so a malformed entry can never permanently freeze a profile. Default TTL is 5 minutes and a separate `usage-refresh.lock` prevents concurrent refresh storms.
 - **Auto-unfreeze on reset day**: at pick time, if `resets_at` has passed, the stale 100% mark is ignored automatically.
 - **Cold-start protection**: lazy preflight covers a fresh `state.json` on the first automatic pick. `ExecStartPre=/path/to/kiro-pool usage --update-state` is still useful for systemd deployments when you want to pay that latency at service start instead of on the first user request.
 
@@ -169,6 +169,8 @@ flock_timeout_ms          = 5000      # flock acquire timeout per command
 usage_preflight_enabled   = true      # kiro-wrap refreshes stale idle usage before automatic pick
 usage_preflight_ttl_secs  = 300       # refresh an idle profile only when cached usage is older than this
 usage_preflight_lock_timeout_ms = 60000 # wait for another preflight refresh before using cached usage
+usage_preflight_max_parallel = 4      # how many kiro-cli /usage workers may run concurrently (>=1)
+usage_preflight_stale_force_refresh_hours = 24 # 100%-used profile with missing resets_at: refresh after this many hours (0 = never)
 
 # tier → kiro-cli default model. wrap injects `--model <X>` automatically based on the picked profile's
 # tier, since settings/cli.json is shared across the pool — per-profile override has to be a CLI flag.
@@ -192,6 +194,7 @@ Incoming env switches:
 | `KIRO_POOL_DIR` | override the default `~/.kiro-pool` |
 | `KIRO_POOL_PROFILE` | force a specific profile, skip rotation (still tracked as in_use / released) |
 | `KIRO_WRAP_NO_STDOUT_TEE=1` | force stdout `inherit` instead of tee+ring. ACP already takes this path automatically; flip this if a non-ACP pipeline gets stuck on handshake |
+| `KIRO_WRAP_QUIET_PREFLIGHT=1` | silence preflight info messages even on a TTY. By default these `kiro-wrap: usage preflight ...` info lines are printed when stderr is a TTY and suppressed on non-TTY (openab / systemd / pipeline) callers; setting this to non-empty/non-`0` forces silence everywhere. Warnings (failed fetches) still print. |
 
 Exported to the child `kiro-cli` process:
 

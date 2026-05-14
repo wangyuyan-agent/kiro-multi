@@ -109,37 +109,63 @@ fn maybe_refresh_usage_before_pick(pool_dir: &Path, cfg: &Config) {
     }
 }
 
+/// preflight 是否打印 info 级日志（"refreshing N", "already running"）。
+/// Warning 级（失败消息）始终打印，不受此影响。
+///
+/// 规则：
+/// - `KIRO_WRAP_QUIET_PREFLIGHT` 设为非空且非 "0" → 显式静默（最高优先级）
+/// - 否则，stderr 是 TTY → 打印；非 TTY（openab / systemd / pipeline）→ 静默
+fn preflight_info_enabled() -> bool {
+    if let Ok(v) = std::env::var("KIRO_WRAP_QUIET_PREFLIGHT") {
+        if !v.is_empty() && v != "0" {
+            return false;
+        }
+    }
+    std::io::stderr().is_terminal()
+}
+
 fn refresh_usage_before_pick(pool_dir: &Path, cfg: &Config) -> Result<()> {
     let state = read_state(pool_dir)?;
-    let mut names = usage_preflight_names(&state, Utc::now(), cfg.usage_preflight_ttl_secs);
+    let mut names = usage_preflight_names(
+        &state,
+        Utc::now(),
+        cfg.usage_preflight_ttl_secs,
+        cfg.usage_preflight_stale_force_refresh_hours,
+    );
     if names.is_empty() {
         return Ok(());
     }
 
     let Some(lock) = acquire_usage_preflight_lock(pool_dir, cfg.usage_preflight_lock_timeout_ms)?
     else {
-        eprintln!("kiro-wrap: usage preflight already running; using cached usage");
+        if preflight_info_enabled() {
+            eprintln!("kiro-wrap: usage preflight already running; using cached usage");
+        }
         return Ok(());
     };
 
     let state = read_state(pool_dir)?;
-    names = usage_preflight_names(&state, Utc::now(), cfg.usage_preflight_ttl_secs);
+    names = usage_preflight_names(
+        &state,
+        Utc::now(),
+        cfg.usage_preflight_ttl_secs,
+        cfg.usage_preflight_stale_force_refresh_hours,
+    );
     if names.is_empty() {
         let _ = lock.unlock();
         return Ok(());
     }
 
-    eprintln!(
-        "kiro-wrap: usage preflight refreshing {} stale idle profile(s)",
-        names.len()
-    );
-    let mut fetched = Vec::new();
-    for name in names {
-        match fetch_profile_usage(pool_dir, &name) {
-            Some(usage) => fetched.push((name, usage)),
-            None => eprintln!("kiro-wrap: usage preflight failed for {name}; keeping cached usage"),
-        }
+    let info = preflight_info_enabled();
+    if info {
+        eprintln!(
+            "kiro-wrap: usage preflight refreshing {} stale idle profile(s)",
+            names.len()
+        );
     }
+
+    let max_parallel = cfg.usage_preflight_max_parallel.max(1);
+    let fetched = fetch_profile_usage_parallel(pool_dir, &names, max_parallel);
 
     if !fetched.is_empty() {
         with_state(pool_dir, |s| {
@@ -156,7 +182,51 @@ fn refresh_usage_before_pick(pool_dir: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Vec<String> {
+/// 并发 fetch_profile_usage：每批最多 `max_parallel` 个线程同时跑 kiro-cli /usage，
+/// 一批 join 完再启动下一批。比串行总耗时低一个数量级（典型 4 个 token 的池子
+/// 从最坏 120s 缩到 30s）；同时通过分批限流避免 N 大时同时拉起 N 个 kiro-cli 子
+/// 进程压垮系统。
+///
+/// fetch 失败的 profile 在 stderr 打 warning（warning 级总是打印，不被 quiet env 影响）。
+fn fetch_profile_usage_parallel(
+    pool_dir: &Path,
+    names: &[String],
+    max_parallel: usize,
+) -> Vec<(String, ProfileUsage)> {
+    let mut fetched: Vec<(String, ProfileUsage)> = Vec::with_capacity(names.len());
+    let batch_size = max_parallel.max(1);
+    std::thread::scope(|s| {
+        for batch in names.chunks(batch_size) {
+            let mut handles = Vec::with_capacity(batch.len());
+            for name in batch {
+                let name = name.clone();
+                handles.push(s.spawn(move || {
+                    let usage = fetch_profile_usage(pool_dir, &name);
+                    (name, usage)
+                }));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok((name, Some(usage))) => fetched.push((name, usage)),
+                    Ok((name, None)) => eprintln!(
+                        "kiro-wrap: usage preflight failed for {name}; keeping cached usage"
+                    ),
+                    Err(_) => {
+                        eprintln!("kiro-wrap: usage preflight worker panicked; ignoring")
+                    }
+                }
+            }
+        }
+    });
+    fetched
+}
+
+fn usage_preflight_names(
+    state: &State,
+    now: DateTime<Utc>,
+    ttl_secs: u64,
+    stale_force_refresh_hours: u64,
+) -> Vec<String> {
     let ttl = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
     state
         .order
@@ -171,11 +241,9 @@ fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Ve
             if profile.cooldown_until.is_some_and(|cd| cd > now) {
                 return false;
             }
-            if profile
-                .last_usage
-                .as_ref()
-                .is_some_and(|usage| usage_exhausted_until_reset(usage, now))
-            {
+            if profile.last_usage.as_ref().is_some_and(|usage| {
+                usage_exhausted_until_reset(usage, now, stale_force_refresh_hours)
+            }) {
                 return false;
             }
             match profile
@@ -191,17 +259,43 @@ fn usage_preflight_names(state: &State, now: DateTime<Utc>, ttl_secs: u64) -> Ve
         .collect()
 }
 
-fn usage_exhausted_until_reset(usage: &ProfileUsage, now: DateTime<Utc>) -> bool {
+/// 判定一个 100% 已耗尽的 profile 是否应当**继续**跳过 preflight（即"还没到该
+/// 重新核查的时候"）。
+///
+/// 三种分支：
+/// 1. used_percent < 100 → 不耗尽，正常进 ttl 判定，函数返回 false（不跳过）。
+/// 2. 有 `resets_at`：今天 ≥ reset_date → expired，函数返回 false（要 refresh）；
+///    否则返回 true（跳过，等待 reset 日）。
+/// 3. 无 `resets_at`（数据残缺 / 解析失败）：以前永久跳过 → 现在改为按
+///    `stale_force_refresh_hours` 兜底，超过该小时数就强制 refresh 一次。
+///    `stale_force_refresh_hours == 0` 时回到 v0.2.4 的"永久跳过"语义。
+fn usage_exhausted_until_reset(
+    usage: &ProfileUsage,
+    now: DateTime<Utc>,
+    stale_force_refresh_hours: u64,
+) -> bool {
     if usage.used_percent < 100.0 {
         return false;
     }
-    let expired = usage
-        .resets_at
-        .as_deref()
-        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-        .map(|reset_date| now.date_naive() >= reset_date)
-        .unwrap_or(false);
-    !expired
+    if usage.resets_at.is_some() {
+        let expired = usage
+            .resets_at
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .map(|reset_date| now.date_naive() >= reset_date)
+            .unwrap_or(false);
+        return !expired;
+    }
+    // No reset_date: fall back to age-based force-refresh.
+    if stale_force_refresh_hours == 0 {
+        return true; // 永久跳过（v0.2.4 行为）
+    }
+    let threshold =
+        chrono::Duration::hours(i64::try_from(stale_force_refresh_hours).unwrap_or(i64::MAX));
+    match usage.updated_at {
+        Some(updated_at) => now.signed_duration_since(updated_at) < threshold,
+        None => false, // 从未刷新过 → 立刻 refresh
+    }
 }
 
 fn acquire_usage_preflight_lock(pool_dir: &Path, timeout_ms: u64) -> Result<Option<File>> {
@@ -749,7 +843,7 @@ mod tests {
             },
         );
 
-        let names = usage_preflight_names(&state, now, 300);
+        let names = usage_preflight_names(&state, now, 300, 24);
 
         assert_eq!(names, vec!["stale".to_string(), "missing".to_string()]);
     }
@@ -769,7 +863,7 @@ mod tests {
             },
         );
 
-        assert_eq!(usage_preflight_names(&state, now, 0), vec!["fresh"]);
+        assert_eq!(usage_preflight_names(&state, now, 0, 24), vec!["fresh"]);
     }
 
     #[test]
@@ -817,8 +911,69 @@ mod tests {
             },
         );
 
-        let names = usage_preflight_names(&state, now, 300);
+        // updated_at=1h ago，stale_force_refresh_hours=24h → unknown_reset 仍跳过
+        let names = usage_preflight_names(&state, now, 300, 24);
 
         assert_eq!(names, vec!["reset_ready".to_string()]);
+    }
+
+    #[test]
+    fn usage_preflight_force_refreshes_stale_unknown_reset() {
+        // 已耗尽 + 无 resets_at + last_usage.updated_at 超过 stale_force_refresh_hours
+        // → 应当被强制 refresh 而非永久跳过（v0.2.5 fix）。
+        let now = Utc::now();
+        let mut state = State {
+            order: vec!["very_stale".to_string()],
+            ..State::default()
+        };
+        state.profiles.insert(
+            "very_stale".to_string(),
+            Profile {
+                last_usage: Some(ProfileUsage {
+                    used_percent: 100.0,
+                    updated_at: Some(now - Duration::hours(25)),
+                    resets_at: None,
+                    ..ProfileUsage::default()
+                }),
+                ..Profile::default()
+            },
+        );
+
+        // 默认 24h 阈值：updated_at 25h 之前 → 强制 refresh
+        let names = usage_preflight_names(&state, now, 300, 24);
+        assert_eq!(names, vec!["very_stale".to_string()]);
+
+        // stale_force_refresh_hours=0 → 关闭强制 refresh，回退到 v0.2.4 永久跳过行为
+        let names = usage_preflight_names(&state, now, 300, 0);
+        assert!(names.is_empty());
+
+        // 1h 阈值，但 updated_at=25h 之前 → 远超阈值 → 仍然 refresh
+        let names = usage_preflight_names(&state, now, 300, 1);
+        assert_eq!(names, vec!["very_stale".to_string()]);
+    }
+
+    #[test]
+    fn usage_preflight_keeps_skipping_recent_unknown_reset() {
+        // 已耗尽 + 无 resets_at + last_usage.updated_at 仍新 → 继续跳过（v0.2.4 行为不变）。
+        let now = Utc::now();
+        let mut state = State {
+            order: vec!["recent".to_string()],
+            ..State::default()
+        };
+        state.profiles.insert(
+            "recent".to_string(),
+            Profile {
+                last_usage: Some(ProfileUsage {
+                    used_percent: 100.0,
+                    updated_at: Some(now - Duration::hours(1)),
+                    resets_at: None,
+                    ..ProfileUsage::default()
+                }),
+                ..Profile::default()
+            },
+        );
+
+        let names = usage_preflight_names(&state, now, 300, 24);
+        assert!(names.is_empty());
     }
 }
