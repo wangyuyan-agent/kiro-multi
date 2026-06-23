@@ -441,6 +441,11 @@ pub const USAGE_FETCH_TIMEOUT_SECS: u64 = 30;
 /// 過期要交互登錄）讓 `kiro-pool usage` / `list --refresh-usage` 整條命令 hang。
 pub fn fetch_profile_usage(pool_dir: &Path, name: &str) -> Option<ProfileUsage> {
     let home = profile_home(pool_dir, name);
+    if let Err(e) = ensure_keychain(&home) {
+        eprintln!("kiro-pool: fetch_profile_usage({name}) keychain setup failed: {e:#}");
+        return None;
+    }
+
     let kiro_home = profile_kiro_home(&home);
     let mut child = std::process::Command::new("kiro-cli")
         .args(["chat", "--no-interactive", "/usage"])
